@@ -3,11 +3,17 @@ const prisma = require('../db');
 const auth = require('../middleware/auth');
 const router = express.Router();
 
-// Simple mock rate provider
 function getMockRate(from, to) {
-  if (from === 'ZAR' && to === 'USD') return 0.056;
-  if (from === 'ZAR' && to === 'EUR') return 0.051;
-  if (from === 'USD' && to === 'ZAR') return 18;
+  if (from === to) return 1;
+
+  const base = {
+    ZAR: { USD: 0.056, EUR: 0.051, ZIG: 1.64 }
+  };
+
+  if (base[from] && base[from][to] != null) return base[from][to];
+
+  if (base[to] && base[to][from] != null) return 1 / base[to][from];
+
   return 1;
 }
 
@@ -15,31 +21,22 @@ function getMockRate(from, to) {
 router.post('/convert', auth, async (req, res) => {
   try {
     const { source, target, amount } = req.body;
-    if (!source || !target || !amount) return res.status(400).json({ error: 'Missing fields' });
+    if (!source || !target || amount == null) return res.status(400).json({ error: 'Missing fields' });
+
+    const amtSource = Number(amount);
+    if (!isFinite(amtSource) || amtSource <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
     const rate = getMockRate(source, target);
-    const amountTarget = Number(amount) * rate;
+    const amountTarget = amtSource * rate;
 
     const wallet = await prisma.wallet.findUnique({ where: { userId: req.user.id } });
     if (!wallet) return res.status(500).json({ error: 'User wallet not found' });
 
-    const partialReserve = Number(amount) * 0.5;
+    const partialReserve = amtSource * 0.5;
 
-    const conv = await prisma.conversionRequest.create({
-      data: {
-        userId: req.user.id,
-        sourceCurrency: source,
-        targetCurrency: target,
-        amountSource: amount,
-        amountTargetEst: amountTarget,
-        status: 'PENDING'
-      }
-    });
-
-    // Reserve logic: if availableBalance covers partialReserve subtract, otherwise simulate top-up by setting available to 0
-    const available = Number(wallet.availableBalance);
+    const available = Number(wallet.availableBalance) || 0;
     let newAvailable = available;
-    let newReserved = Number(wallet.reservedBalance);
+    let newReserved = Number(wallet.reservedBalance) || 0;
 
     if (available >= partialReserve) {
       newAvailable = available - partialReserve;
@@ -48,6 +45,17 @@ router.post('/convert', auth, async (req, res) => {
       newAvailable = 0;
       newReserved = newReserved + partialReserve;
     }
+
+    const conv = await prisma.conversionRequest.create({
+      data: {
+        userId: req.user.id,
+        sourceCurrency: source,
+        targetCurrency: target,
+        amountSource: amtSource.toString(),
+        amountTargetEst: amountTarget.toString(),
+        status: 'PENDING'
+      }
+    });
 
     await prisma.wallet.update({
       where: { id: wallet.id },
@@ -60,7 +68,7 @@ router.post('/convert', auth, async (req, res) => {
     await prisma.transaction.create({
       data: {
         walletId: wallet.id,
-        amount: partialReserve,
+        amount: partialReserve.toString(),
         currency: source,
         type: 'CONVERSION',
         metadata: { conversionRequestId: conv.id }
@@ -89,13 +97,15 @@ router.post('/webhook/conversion-callback', async (req, res) => {
       const wallet = await prisma.wallet.findUnique({ where: { userId: conv.userId } });
       if (!wallet) return res.status(500).json({ error: 'Wallet not found' });
 
-      const remaining = Number(conv.amountSource) * 0.5;
-      const newAvailable = Number(wallet.availableBalance) + remaining;
+      const remaining = Number(conv.amountSource || 0) * 0.5;
+      const newAvailable = (Number(wallet.availableBalance) || 0) + remaining;
+      const newReserved = Math.max((Number(wallet.reservedBalance) || 0) - remaining, 0);
 
       await prisma.wallet.update({
         where: { id: wallet.id },
         data: {
           availableBalance: newAvailable.toString(),
+          reservedBalance: newReserved.toString(),
           tierStatus: 'FULL'
         }
       });
@@ -103,7 +113,7 @@ router.post('/webhook/conversion-callback', async (req, res) => {
       await prisma.transaction.create({
         data: {
           walletId: wallet.id,
-          amount: remaining,
+          amount: remaining.toString(),
           currency: conv.sourceCurrency,
           type: 'UNLOCK',
           metadata: { conversionRequestId: conv.id }
