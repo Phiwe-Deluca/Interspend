@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: interspend_user
+      POSTGRES_PASSWORD: interspend_pass
+      POSTGRES_DB: interspend_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://interspend_user:interspend_pass@postgres:5432/interspend_db
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+    command: npm run dev
+
+volumes:
+  postgres_data:
